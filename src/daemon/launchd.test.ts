@@ -665,4 +665,67 @@ describe("stopLaunchAgent — ensurePidGone integration", () => {
     expect(processKillSpy).not.toHaveBeenCalledWith(testPid, "SIGKILL");
     expect(chunks.join("")).not.toContain("Warning:");
   });
+
+  it("bootstrap fallback path also calls ensurePidGone when prevPid is known", async () => {
+    // When kickstart fails with "not found" and falls through to bootstrap+retry,
+    // the prevPid captured before the first kickstart should still be waited on.
+    const env = testEnv;
+    state.printOutput = `state = running\npid = ${testPid}`;
+    state.psOutput = "Mon Apr 19 09:00:00 2026";
+    // First kickstart attempt fails with "not found" → triggers bootstrap fallback.
+    state.kickstartError = "Could not find service";
+    state.kickstartFailuresRemaining = 1;
+
+    // kill(0) → ESRCH: process gracefully exited, no SIGKILL needed.
+    processKillSpy.mockImplementation((_p: number, sig: number | string) => {
+      if (sig === 0) {
+        const err = Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+        throw err;
+      }
+      return true as unknown as void;
+    });
+
+    const chunks: string[] = [];
+    const stdout = new PassThrough();
+    stdout.on("data", (c: Buffer) => chunks.push(c.toString()));
+    const result = await restartLaunchAgent({ env, stdout });
+
+    expect(result).toEqual({ outcome: "completed" });
+    // ensurePidGone should have been invoked for the pre-captured PID.
+    expect(processKillSpy).toHaveBeenCalledWith(testPid, 0);
+    expect(processKillSpy).not.toHaveBeenCalledWith(testPid, "SIGKILL");
+    expect(chunks.join("")).not.toContain("Warning:");
+  });
+
+  it("bootstrap fallback path emits warning when ensurePidGone returns false (EPERM)", async () => {
+    const env = testEnv;
+    state.printOutput = `state = running\npid = ${testPid}`;
+    state.psOutput = "Mon Apr 19 09:00:00 2026";
+    state.kickstartError = "Could not find service";
+    state.kickstartFailuresRemaining = 1;
+
+    let nowCallCount = 0;
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      nowCallCount++;
+      return nowCallCount === 1 ? 0 : 20_000;
+    });
+
+    // kill(0) never throws → process appears alive; SIGKILL throws EPERM → returns false
+    processKillSpy.mockImplementation((_p: number, sig: number | string) => {
+      if (sig === "SIGKILL") {
+        const err = Object.assign(new Error("EPERM"), { code: "EPERM" });
+        throw err;
+      }
+      return true as unknown as void;
+    });
+
+    const chunks: string[] = [];
+    const stdout = new PassThrough();
+    stdout.on("data", (c: Buffer) => chunks.push(c.toString()));
+    const result = await restartLaunchAgent({ env, stdout });
+
+    expect(result).toEqual({ outcome: "completed" });
+    expect(chunks.join("")).toContain("Warning:");
+    expect(chunks.join("")).toContain(String(testPid));
+  });
 });

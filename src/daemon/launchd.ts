@@ -683,6 +683,17 @@ export async function restartLaunchAgent({
   if (retry.code !== 0) {
     throw new Error(`launchctl kickstart failed: ${retry.stderr || retry.stdout}`.trim());
   }
+  // Mirror the kickstart-success path: verify the previous process is actually
+  // gone after the bootstrap + retry sequence so any port-still-busy race is
+  // observable (same guard as the primary kickstart success branch above).
+  if (typeof prevPid === "number") {
+    const gone = await ensurePidGone(prevPid, prevPidIdentity);
+    if (!gone) {
+      stdout.write(
+        `Warning: PID ${prevPid} may still be running after restart; port may not be free yet.\n`,
+      );
+    }
+  }
   try {
     stdout.write(`${formatLine("Restarted LaunchAgent", serviceTarget)}\n`);
   } catch (err: unknown) {
