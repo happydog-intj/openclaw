@@ -337,27 +337,8 @@ describe("launchd install", () => {
     expect(state.fileModes.get(plistPath)).toBe(0o644);
   });
 
-  it("restarts LaunchAgent with kickstart and no bootout", async () => {
+  it("restarts LaunchAgent: bootout → ensurePidGone → bootstrap → kickstart (no -k)", async () => {
     const env = createDefaultLaunchdEnv();
-    const result = await restartLaunchAgent({
-      env,
-      stdout: new PassThrough(),
-    });
-
-    const domain = typeof process.getuid === "function" ? `gui/${process.getuid()}` : "gui/501";
-    const label = "ai.openclaw.gateway";
-    const serviceId = `${domain}/${label}`;
-    expect(result).toEqual({ outcome: "completed" });
-    expect(state.launchctlCalls).toContainEqual(["kickstart", "-k", serviceId]);
-    expect(state.launchctlCalls.some((call) => call[0] === "bootout")).toBe(false);
-    expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(false);
-  });
-
-  it("falls back to bootstrap when kickstart cannot find the service", async () => {
-    const env = createDefaultLaunchdEnv();
-    state.kickstartError = "Could not find service";
-    state.kickstartFailuresRemaining = 1;
-
     const result = await restartLaunchAgent({
       env,
       stdout: new PassThrough(),
@@ -367,24 +348,39 @@ describe("launchd install", () => {
     const label = "ai.openclaw.gateway";
     const plistPath = resolveLaunchAgentPlistPath(env);
     const serviceId = `${domain}/${label}`;
-    const kickstartCalls = state.launchctlCalls.filter(
-      (c) => c[0] === "kickstart" && c[1] === "-k" && c[2] === serviceId,
-    );
-    const enableIndex = state.launchctlCalls.findIndex(
-      (c) => c[0] === "enable" && c[1] === serviceId,
-    );
-    const bootstrapIndex = state.launchctlCalls.findIndex(
-      (c) => c[0] === "bootstrap" && c[1] === domain && c[2] === plistPath,
-    );
-
     expect(result).toEqual({ outcome: "completed" });
-    expect(kickstartCalls).toHaveLength(2);
-    expect(enableIndex).toBeGreaterThanOrEqual(0);
-    expect(bootstrapIndex).toBeGreaterThanOrEqual(0);
-    expect(state.launchctlCalls.some((call) => call[0] === "bootout")).toBe(false);
+    // New sequence: bootout first, then bootstrap, then kickstart (no -k).
+    expect(state.launchctlCalls.some((call) => call[0] === "bootout")).toBe(true);
+    expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(true);
+    expect(state.launchctlCalls).toContainEqual(["kickstart", serviceId]);
+    // Must NOT use kickstart -k (that would start new process before old one exits).
+    expect(state.launchctlCalls.some((c) => c[0] === "kickstart" && c[1] === "-k")).toBe(false);
+    // Verify ordering: bootout before bootstrap before kickstart.
+    const bootoutIdx = state.launchctlCalls.findIndex((c) => c[0] === "bootout");
+    const bootstrapIdx = state.launchctlCalls.findIndex((c) => c[0] === "bootstrap" && c[1] === domain && c[2] === plistPath);
+    const kickstartIdx = state.launchctlCalls.findIndex((c) => c[0] === "kickstart" && c[1] === serviceId);
+    expect(bootoutIdx).toBeLessThan(bootstrapIdx);
+    expect(bootstrapIdx).toBeLessThan(kickstartIdx);
   });
 
-  it("surfaces the original kickstart failure when the service is still loaded", async () => {
+  it("kickstart failure in restart path surfaces error after bootout+bootstrap", async () => {
+    const env = createDefaultLaunchdEnv();
+    state.kickstartError = "Could not find service";
+    state.kickstartFailuresRemaining = 1;
+
+    await expect(
+      restartLaunchAgent({
+        env,
+        stdout: new PassThrough(),
+      }),
+    ).rejects.toThrow("launchctl kickstart failed: Could not find service");
+
+    // bootout and bootstrap are still called (they precede kickstart in the new flow).
+    expect(state.launchctlCalls.some((call) => call[0] === "bootout")).toBe(true);
+    expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(true);
+  });
+
+  it("surfaces kickstart failure after bootout+bootstrap; does not retry", async () => {
     const env = createDefaultLaunchdEnv();
     state.kickstartError = "Input/output error";
     state.kickstartFailuresRemaining = 1;
@@ -396,8 +392,11 @@ describe("launchd install", () => {
       }),
     ).rejects.toThrow("launchctl kickstart failed: Input/output error");
 
-    expect(state.launchctlCalls.some((call) => call[0] === "enable")).toBe(false);
-    expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(false);
+    // In the new flow, enable and bootstrap are always called before kickstart.
+    expect(state.launchctlCalls.some((call) => call[0] === "enable")).toBe(true);
+    expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(true);
+    // No retry after kickstart failure.
+    expect(state.launchctlCalls.filter((c) => c[0] === "kickstart")).toHaveLength(1);
   });
 
   it("hands restart off to a detached helper when invoked from the current LaunchAgent", async () => {
@@ -666,15 +665,12 @@ describe("stopLaunchAgent — ensurePidGone integration", () => {
     expect(chunks.join("")).not.toContain("Warning:");
   });
 
-  it("bootstrap fallback path also calls ensurePidGone when prevPid is known", async () => {
-    // When kickstart fails with "not found" and falls through to bootstrap+retry,
-    // the prevPid captured before the first kickstart should still be waited on.
+  it("ensurePidGone is called before kickstart in main restart path when prevPid is known", async () => {
+    // The new flow always does: bootout → ensurePidGone → bootstrap → kickstart.
+    // Verify that ensurePidGone (via kill(0) liveness check) runs before kickstart.
     const env = testEnv;
     state.printOutput = `state = running\npid = ${testPid}`;
     state.psOutput = "Mon Apr 19 09:00:00 2026";
-    // First kickstart attempt fails with "not found" → triggers bootstrap fallback.
-    state.kickstartError = "Could not find service";
-    state.kickstartFailuresRemaining = 1;
 
     // kill(0) → ESRCH: process gracefully exited, no SIGKILL needed.
     processKillSpy.mockImplementation((_p: number, sig: number | string) => {
@@ -691,18 +687,18 @@ describe("stopLaunchAgent — ensurePidGone integration", () => {
     const result = await restartLaunchAgent({ env, stdout });
 
     expect(result).toEqual({ outcome: "completed" });
-    // ensurePidGone should have been invoked for the pre-captured PID.
+    // ensurePidGone should have polled liveness via kill(0) for the pre-bootout PID.
     expect(processKillSpy).toHaveBeenCalledWith(testPid, 0);
     expect(processKillSpy).not.toHaveBeenCalledWith(testPid, "SIGKILL");
     expect(chunks.join("")).not.toContain("Warning:");
   });
 
-  it("bootstrap fallback path emits warning when ensurePidGone returns false (EPERM)", async () => {
+  it("restart path emits warning when ensurePidGone returns false (EPERM) before kickstart", async () => {
+    // If SIGKILL throws EPERM, ensurePidGone returns false and a warning is emitted
+    // before kickstart starts the new process.
     const env = testEnv;
     state.printOutput = `state = running\npid = ${testPid}`;
     state.psOutput = "Mon Apr 19 09:00:00 2026";
-    state.kickstartError = "Could not find service";
-    state.kickstartFailuresRemaining = 1;
 
     let nowCallCount = 0;
     nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {

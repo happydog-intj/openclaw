@@ -623,9 +623,8 @@ export async function restartLaunchAgent({
     return { outcome: "scheduled" };
   }
 
-  // Capture PID and identity BEFORE kickstart so that, if `kickstart -k` does
-  // not fully drain the old process, we can verify the old PID is gone before
-  // the new instance races for the port (mirrors the stopLaunchAgent pattern).
+  // Step 1: Capture PID and identity BEFORE bootout so we can wait for the old
+  // process to exit before starting the new one — closing the port 18789 race.
   const printBefore = await execLaunchctl(["print", serviceTarget]);
   const prevPid =
     printBefore.code === 0
@@ -633,34 +632,28 @@ export async function restartLaunchAgent({
       : undefined;
   const prevPidIdentity = typeof prevPid === "number" ? await getPidStartTime(prevPid) : undefined;
 
-  const start = await execLaunchctl(["kickstart", "-k", serviceTarget]);
-  if (start.code === 0) {
-    // Verify the previous process is actually gone; `kickstart -k` should
-    // handle this, but warn if the PID is still alive after the restart so
-    // the port-still-busy race is observable.
-    if (typeof prevPid === "number") {
-      const gone = await ensurePidGone(prevPid, prevPidIdentity);
-      if (!gone) {
-        stdout.write(
-          `Warning: PID ${prevPid} may still be running after restart; port may not be free yet.\n`,
-        );
-      }
-    }
-    try {
-      stdout.write(`${formatLine("Restarted LaunchAgent", serviceTarget)}\n`);
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException)?.code !== "EPIPE") {
-        throw err;
-      }
-    }
-    return { outcome: "completed" };
+  // Step 2: Bootout — send SIGTERM to the old process and unregister the service.
+  // If the service was never loaded the error is benign; any other failure is fatal.
+  const bootout = await execLaunchctl(["bootout", serviceTarget]);
+  if (bootout.code !== 0 && !isLaunchctlNotLoaded(bootout)) {
+    throw new Error(`launchctl bootout failed: ${bootout.stderr || bootout.stdout}`.trim());
   }
 
-  if (!isLaunchctlNotLoaded(start)) {
-    throw new Error(`launchctl kickstart failed: ${start.stderr || start.stdout}`.trim());
+  // Step 3: Wait for the old process to exit BEFORE starting the new one so the
+  // port is guaranteed free.  This is the core fix: previously `kickstart -k`
+  // would start the new process atomically alongside the SIGTERM, so the new
+  // instance could race against the old one for the port.
+  if (typeof prevPid === "number") {
+    const gone = await ensurePidGone(prevPid, prevPidIdentity);
+    if (!gone) {
+      stdout.write(
+        `Warning: PID ${prevPid} may still be running after restart; port may not be free yet.\n`,
+      );
+    }
   }
 
-  // If the service was previously booted out, re-register the plist and retry.
+  // Step 4: Re-register and start the service.  `bootout` unregisters the plist
+  // from launchd, so `bootstrap` is always required before `kickstart`.
   await execLaunchctl(["enable", serviceTarget]);
   const boot = await execLaunchctl(["bootstrap", domain, plistPath]);
   if (boot.code !== 0) {
@@ -679,21 +672,11 @@ export async function restartLaunchAgent({
     throw new Error(`launchctl bootstrap failed: ${detail}`);
   }
 
-  const retry = await execLaunchctl(["kickstart", "-k", serviceTarget]);
-  if (retry.code !== 0) {
-    throw new Error(`launchctl kickstart failed: ${retry.stderr || retry.stdout}`.trim());
+  const start = await execLaunchctl(["kickstart", serviceTarget]);
+  if (start.code !== 0) {
+    throw new Error(`launchctl kickstart failed: ${start.stderr || start.stdout}`.trim());
   }
-  // Mirror the kickstart-success path: verify the previous process is actually
-  // gone after the bootstrap + retry sequence so any port-still-busy race is
-  // observable (same guard as the primary kickstart success branch above).
-  if (typeof prevPid === "number") {
-    const gone = await ensurePidGone(prevPid, prevPidIdentity);
-    if (!gone) {
-      stdout.write(
-        `Warning: PID ${prevPid} may still be running after restart; port may not be free yet.\n`,
-      );
-    }
-  }
+
   try {
     stdout.write(`${formatLine("Restarted LaunchAgent", serviceTarget)}\n`);
   } catch (err: unknown) {
